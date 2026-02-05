@@ -14,10 +14,10 @@
 
 from jinja2 import Environment, FileSystemLoader
 
-from utils.shape_extractor import infer_output_shape_stride
+from codegen.utils.shape_extractor import infer_output_shape_stride
 
 import regex as re
-from typing import List
+from typing import List, Dict, Any
 
 
 def extract_scalar_arg_names(schema_string: str) -> List[str]:
@@ -152,25 +152,30 @@ def format_python_return_type(returns):
 def convert_cpp_type_to_python(cpp_type):
     """Convert C++ type to Python type annotation."""
     # Remove const, &, * modifiers
+    clean_type = re.sub(r"\([a-z]?!?\)", "", cpp_type)
     clean_type = (
-        cpp_type.replace("at::", "")
+        clean_type.replace("at::", "")
         .replace("const", "")
         .replace("&", "")
         .replace("*", "")
         .strip()
     )
     type_mapping = {
-        "ITensorListRef": "list[Tensor]",
-        "TensorList": "list[Tensor]",
-        "Tensor": "torch.Tensor",
-        "int64_t": "int",
-        "double": "float",
         "bool": "bool",
-        "Scalar": "Union[int, float, bool, complex]",
-        "IntArrayRef": "list[int]",
-        "c10::string_view": "str",
-        "DimnameList": "list[str]",
+        "double": "float",
+        "Dimname[]": "list[str]",
         "Dimname": "str",
+        "int[1]?": "int | None",
+        "int[]": "list[int]",
+        "SymInt[]": "list[int]",
+        "SymInt": "int",
+        "str?": "str | None",
+        "str[1]": "str",
+        "ScalarType?": "torch.dtype | None",
+        "ScalarType": "torch.dtype",
+        "Scalar": "Union[int, float, bool, complex]",
+        "Tensor[]": "list[Tensor]",
+        "Tensor": "torch.Tensor",
     }
 
     for cpp, py in type_mapping.items():
@@ -258,6 +263,144 @@ def enhance_replacement_data(rep_data):
     return rep_data
 
 
+def parse_arguments(args_str: str) -> List[Dict[str, Any]]:
+    """
+    Parse argument list from function schema.
+
+    Example:
+        Input:  "Tensor(a!) self, Tensor(b!) other, *, bool copy=False"
+        Output: [
+            {"name": "self", "type": "Tensor(a!)"},
+            {"name": "other", "type": "Tensor(b!)"},
+            {"name": "copy", "type": "bool", "default": "False"},
+        ]
+
+    """
+    arguments = []
+    arg_tokens = [t.strip() for t in args_str.split(",") if t.strip()]
+    # Parse each argument
+    for token in arg_tokens:
+        if token == "*":
+            # Keyword-only separator, skip
+            continue
+
+        arg_dict = parse_single_argument(token)
+        if arg_dict:
+            arguments.append(arg_dict)
+    return arguments
+
+
+def parse_single_argument(arg_str: str) -> Dict[str, Any]:
+    """
+    Parse a single argument token.
+
+    Examples:
+        "Tensor self" -> {type: "Tensor", name: "self"}
+        "Scalar alpha=1" -> {type: "Scalar", name: "alpha", default: "1"}
+        "int? dim=None" -> {type: "int?", name: "dim", default: "None"}
+        "Tensor(a!) out" -> {type: "Tensor(a!)", name: "out"}
+    """
+    # Handle mutable annotations like Tensor(a!)
+    type_match = re.match(
+        r"^(\S+?(?:\([^)]*\))?)\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:=(.+))?$", arg_str
+    )
+
+    if not type_match:
+        return {}
+
+    arg_type = type_match.group(1)
+    arg_name = type_match.group(2)
+    default_val = type_match.group(3)
+
+    arg_dict = {
+        "type": arg_type,
+        "name": arg_name,
+    }
+
+    if default_val:
+        arg_dict["default"] = default_val
+
+    return arg_dict
+
+
+def parse_returns(returns_str: str) -> List[Dict[str, Any]]:
+    """
+    Parse return type(s).
+
+    Examples:
+        "Tensor" -> [{'type': 'Tensor'}]
+        "(Tensor, Tensor)" -> [{'type': 'Tensor'}, {'type': 'Tensor'}]
+        "(Tensor(a!) min, Tensor(b!) max)" -> [{'type': 'Tensor(a!)', 'name': 'min'}, ...]
+    """
+    returns_str = returns_str.strip()
+
+    if returns_str.startswith("(") and returns_str.endswith(")"):
+        inner = returns_str[1:-1]
+        if not inner.strip():  # handle -> ()
+            return []
+        return_tokens = [t.strip() for t in inner.split(",")]
+
+        returns = []
+        for token in return_tokens:
+            match = re.match(
+                r"^(\S+?(?:\([^)]*\))?)\s+([a-zA-Z_][a-zA-Z0-9_]*)$", token
+            )
+            if match:
+                returns.append({"type": match.group(1), "name": match.group(2)})
+            else:
+                returns.append({"type": token})
+
+        return returns
+    else:
+        return [{"type": returns_str}]
+
+
+def parse_func_schema(func_string: str) -> Dict[str, Any]:
+    """
+    Parse a function schema from native_functions.yaml.
+
+    Format: func_name[.overload](args) -> return_type
+
+    Example:
+        "add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor"
+
+    Returns:
+        dict with operator_name, overload_name, arguments, returns, schema
+    """
+    # Extract function name and overload
+    func_match = re.match(
+        r"([a-zA-Z_][a-zA-Z0-9_]*)(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?", func_string
+    )
+    if not func_match:
+        raise ValueError(f"Cannot parse function name from: {func_string}")
+
+    operator_name = func_match.group(1)
+    overload_name = func_match.group(2) or ""
+
+    # Extract arguments and return type
+    schema_match = re.search(r"\((.*?)\)\s*->\s*(.+)", func_string)
+    if not schema_match:
+        raise ValueError(f"Cannot parse schema from: {func_string}")
+
+    args_str = schema_match.group(1)
+    returns_str = schema_match.group(2).strip()
+
+    # Parse arguments
+    arguments = parse_arguments(args_str)
+
+    # Parse returns
+    returns = parse_returns(returns_str)
+
+    return {
+        "operator_name": operator_name,
+        "overload_name": overload_name,
+        "arguments": arguments,
+        "schema_order_arguments": arguments.copy(),
+        "returns": returns,
+        "schema_string": func_string,
+    }
+
+
 def generate_signature_dict(replacement_dict):
     signatures = {}
 
@@ -306,7 +449,7 @@ def generate_from_template(
 
 
 def generate_replacements(
-    all_declarations, all_schemas, metadata, action="skip", only_req=False
+    native_functions_file, metadata, action="skip", only_req=False
 ):
     """
     Generates replacement data for PyTorch ops (specified in declaration and schema files)
@@ -318,26 +461,36 @@ def generate_replacements(
         action (str): what to do if the operator is not supported, options: 'skip', 'fallback', 'native_call'
         only_req (bool): set true to enable filtering with (dispatch=True, default=False)
     """
+    import yaml
+
+    try:
+        with open(native_functions_file, "r") as f:
+            native_functions = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        print(e)
     replacements = []
+    num_total_funcs = len(native_functions)
+    num_supported_funcs = 0
+    gen_op_name_list = []
 
-    num_total_decs = len(all_declarations)
-    num_supported_decs = 0
-
-    for i, declaration in enumerate(all_declarations):
-        schema = all_schemas[i]
-        if only_req:  # only generate for required operations according to docs
-            if not (schema["dispatch"] == "True" and schema["default"] == "False"):
-                print(
-                    f"Warning: {declaration['operator_name']}.{declaration['overload_name']} - Not required, skipping..."
-                )
-                continue
-
+    for func_entry in native_functions:
+        if "func" not in func_entry:
+            continue
+        func_schema = func_entry["func"]
+        try:
+            declaration = parse_func_schema(func_schema)
+        except ValueError as e:
+            print(f"Warning: Failed to parse schema: {func_schema} - {e}")
+            continue
+        if "autogen" in func_entry:
+            declaration["operator_name"] = func_entry["autogen"].split(".")[0]
         if declaration["operator_name"] in metadata:
             declaration["template_name"] = metadata[declaration["operator_name"]][
                 "template_name"
             ]
             cur_metadata = metadata[declaration["operator_name"]]
-            num_supported_decs += 1
+            gen_op_name = declaration["operator_name"] + declaration["overload_name"]
+            num_supported_funcs += 1
         else:
             cur_metadata = {
                 "operator_name": declaration["operator_name"].capitalize(),
@@ -357,10 +510,6 @@ def generate_replacements(
                         f"{action} is not implemented, options: 'skip', 'fallback', 'native', 'auto'"
                     )
 
-        # Use ordered arguments in template
-        declaration["arguments"] = declaration["schema_order_arguments"]
-        del declaration["schema_order_arguments"]
-
         # TODO: If first argument is not a Tensor (e.g. arange), skip.
         if len(declaration["arguments"]) > 0 and any(
             [
@@ -369,27 +518,6 @@ def generate_replacements(
             ]
         ):
             continue
-
-        declaration["template_data"] = {
-            "op_name": declaration["operator_name"]
-            + "_"
-            + (
-                declaration["overload_name"]
-                if declaration["overload_name"]
-                else "default"
-            ),
-            "op_label": f'"{declaration["operator_name"].capitalize()}"',
-            "reg_name": f'"{declaration["operator_name"]}.{declaration["overload_name"]}"'
-            if declaration["overload_name"]
-            else f'"{declaration["operator_name"]}"',
-            "torch_prefix": cur_metadata.get("torch_prefix", "torch"),
-            "torch_func_name": cur_metadata.get(
-                "torch_func_name", declaration["operator_name"]
-            ),
-        }
-
-        signatures = generate_signature_dict(declaration)
-        declaration |= signatures
 
         if (
             declaration["template_name"] in ["view", "view_copy"]
@@ -400,45 +528,184 @@ def generate_replacements(
             )
             continue
 
-        for dec_arg in declaration["arguments"]:
-            if "default" in dec_arg and isinstance(dec_arg["default"], bool):
-                dec_arg["default"] = str(dec_arg["default"]).lower()
+        if gen_op_name not in gen_op_name_list:
+            declaration = generate_replacement_base_variant(declaration, cur_metadata)
+            declaration = enhance_replacement_data(declaration)
+            replacements.append(declaration)
+            gen_op_name_list.append(gen_op_name)
 
-        # unless there is a provided out_shape_stride_expr method, we will skip output shape and stride inference (first input will be used directly)
-        declaration["out_shape_stride_expr"] = cur_metadata.get(
-            "out_shape_stride_expr", "bypass"
-        )
-
-        # if the template is base and out_shape_stride_expr is infer, we can try auto shape inference
-        if (
-            declaration["template_name"] == "base"
-            and declaration["out_shape_stride_expr"] == "infer"
-        ):
-            output_shape_stride_list, bypass_flag = infer_output_shape_stride(
-                declaration
-            )
-            if output_shape_stride_list is None:
-                # Output shape/stride inference has failed, so this operation is skipped
-                # print(f"Warning: {dec['operator_name']}.{dec['overload_name']} - Output shape/stride inference failed, skipping...")
-                continue
-            else:
-                if bypass_flag:
-                    declaration["out_shape_stride_expr"] = "bypass"
-                    # Output shape inference is not necessary
-                    pass
-                else:
-                    # inferred symbolic representation that will be used in the template
-                    for i, output_shape_stride in enumerate(output_shape_stride_list):
-                        if output_shape_stride:
-                            declaration["returns"][i]["shape"] = output_shape_stride[
-                                "shape"
-                            ]
-                            declaration["returns"][i]["stride"] = output_shape_stride[
-                                "stride"
-                            ]
-        declaration = enhance_replacement_data(declaration)
-        replacements.append(declaration)
-
-    print(f"{num_supported_decs} of {num_total_decs} declarations are supported.")
+        if "autogen" in func_entry:
+            autogen_variants = func_entry["autogen"]
+            if not isinstance(autogen_variants, list):
+                autogen_variants = [autogen_variants]
+                for variant in autogen_variants:
+                    # Generate the out variant
+                    if variant.endswith(".out") or "_out" in variant:
+                        out_declaration = generate_replacement_out_variant(
+                            declaration, variant, cur_metadata
+                        )
+                        if out_declaration:
+                            out_declaration = enhance_replacement_data(out_declaration)
+                            replacements.append(out_declaration)
+    print(f"{num_supported_funcs} of {num_total_funcs} declarations are supported.")
 
     return replacements
+
+
+def generate_replacement_base_variant(declaration, cur_metadata):
+    """
+    Process a declaration of each operator, and add template_data and normalize
+    boolean defaults.
+
+    Args:
+    declaration (dict): A dictionary describing a PyTorch operator, including
+                            its name, overload name, and arguments.
+    cur_metadata (dict): curret_metadata obtained from Metadata.yaml file
+
+    Examples:
+    declaration: {'operator_name': 'abs',
+                  'overload_name': '',
+                  'arguments': [{'type': 'Tensor', 'name': 'self'}],
+                  'schema_order_arguments': [{'type': 'Tensor', 'name': 'self'}],
+                  'returns': [{'type': 'Tensor'}],
+                  'schema_string': 'abs(Tensor self) -> Tensor',
+                  'template_name': 'base'}
+    cur_metadata: {'operator_name': 'abs', 'template_name': 'base'}
+
+    Returns:
+    {'operator_name': 'abs',
+     'overload_name': '',
+     'arguments': [{'type': 'Tensor', 'name': 'self'}],
+     'schema_order_arguments': [{'type': 'Tensor', 'name': 'self'}],
+     'returns': [{'type': 'Tensor'}],
+     'schema_string': 'abs(Tensor self) -> Tensor',
+     'template_name': 'base',
+     'template_data': {'op_name': 'abs_default', 'op_label': '"Abs"', 'reg_name': '"abs"', 'torch_prefix': 'torch', 'torch_func_name': 'abs'},
+     'signature_out': 'Tensor',
+     'signature_in': 'Tensor self',
+     'out_shape_stride_expr': 'bypass'}
+
+    """
+
+    declaration["template_data"] = {
+        "op_name": declaration["operator_name"]
+        + "_"
+        + (declaration["overload_name"] if declaration["overload_name"] else "default"),
+        "op_label": f'"{declaration["operator_name"].capitalize()}"',
+        "reg_name": f'"{declaration["operator_name"]}.{declaration["overload_name"]}"'
+        if declaration["overload_name"]
+        else f'"{declaration["operator_name"]}"',
+        "torch_prefix": cur_metadata.get("torch_prefix", "torch"),
+        "torch_func_name": cur_metadata.get(
+            "torch_func_name", declaration["operator_name"]
+        ),
+    }
+
+    signatures = generate_signature_dict(declaration)
+    declaration |= signatures
+
+    for dec_arg in declaration["arguments"]:
+        if "default" in dec_arg and isinstance(dec_arg["default"], bool):
+            dec_arg["default"] = str(dec_arg["default"]).lower()
+
+    # unless there is a provided out_shape_stride_expr method, we will skip output shape and stride inference (first input will be used directly)
+    declaration["out_shape_stride_expr"] = cur_metadata.get(
+        "out_shape_stride_expr", "bypass"
+    )
+
+    # if the template is base and out_shape_stride_expr is infer, we can try auto shape inference
+    if (
+        declaration["template_name"] == "base"
+        and declaration["out_shape_stride_expr"] == "infer"
+    ):
+        output_shape_stride_list, bypass_flag = infer_output_shape_stride(declaration)
+        if output_shape_stride_list is not None:
+            if bypass_flag:
+                declaration["out_shape_stride_expr"] = "bypass"
+                # Output shape inference is not necessary
+                pass
+            else:
+                # inferred symbolic representation that will be used in the template
+                for i, output_shape_stride in enumerate(output_shape_stride_list):
+                    if output_shape_stride:
+                        declaration["returns"][i]["shape"] = output_shape_stride[
+                            "shape"
+                        ]
+                        declaration["returns"][i]["stride"] = output_shape_stride[
+                            "stride"
+                        ]
+    return declaration
+
+
+def generate_replacement_out_variant(base_declaration, variant_name, cur_metadata):
+    """
+    Generate an .out variant from a base declaration.
+    Args:
+        base_declaration: The base function declaration
+        variant_name: The variant name (e.g., "repeat.out")
+        cur_metadata: Metadata for the operator
+
+    Returns:
+        New declaration for the .out variant
+    """
+    import copy
+
+    # Extract overload name from variant (e.g., "repeat.out" -> "out")
+    overload = variant_name.split(".")[-1] if "." in variant_name else variant_name
+
+    # Create a copy of the base declaration
+    out_declaration = copy.deepcopy(base_declaration)
+
+    # Update overload name
+    out_declaration["overload_name"] = overload
+
+    # Add 'out' parameter to arguments
+    # The out parameter should match the return type
+    if out_declaration["returns"]:
+        return_type = out_declaration["returns"][0]["type"]
+
+        # Create out parameter
+        out_param = {
+            "type": return_type,
+            "name": "out",
+        }
+
+        # Add out parameter at the end
+        out_declaration["arguments"].append(out_param)
+        out_declaration["schema_order_arguments"].append(out_param)
+
+    # Update schema string to include .out overload
+    original_schema = out_declaration["schema_string"]
+    # Insert .out into the schema
+    out_declaration["schema_string"] = original_schema.replace(
+        f"{out_declaration['operator_name']}(",
+        f"{out_declaration['operator_name']}.{overload}(",
+        1,
+    )
+
+    # Also add out parameter to schema
+    # Find the closing parenthesis before ->
+    schema_parts = out_declaration["schema_string"].split("->")
+    if len(schema_parts) == 2:
+        args_part = schema_parts[0].rstrip()
+        return_part = schema_parts[1].strip()
+
+        # Add out parameter before closing parenthesis
+        if args_part.endswith(")"):
+            args_part = args_part[:-1] + f", {return_type} out)"
+
+        out_declaration["schema_string"] = f"{args_part} -> {return_part}"
+
+    # Don't re-process metadata, just update the template_data
+    out_declaration["template_data"] = {
+        "op_name": out_declaration["operator_name"] + "_" + overload,
+        "op_label": f'"{out_declaration["operator_name"].capitalize()}"',
+        "sendnn_func_name": cur_metadata.get("sendnn_func_name", ""),
+        "reg_name": f'"{out_declaration["operator_name"]}.{overload}"',
+        "torch_prefix": cur_metadata.get("torch_prefix", "torch"),
+        "torch_func_name": cur_metadata.get(
+            "torch_func_name", out_declaration["operator_name"]
+        ),
+    }
+
+    return out_declaration
