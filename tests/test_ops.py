@@ -526,7 +526,7 @@ class TestOps(TestCase):
             z, torch.matmul(x, y), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("TODO: mean.out not implemented in eager mode")
+    #@unittest.skip("TODO: mean.out not implemented in eager mode")
     def test_mean(self):
         x = torch.tensor([[[1, 2, 3], [4, 5, 6]]], dtype=self.dtype)
         x_spyre = x.to("spyre")
