@@ -355,6 +355,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_sqrt_fp32",
+            "test_unary_op",
+        ): {
+            "ops_dict": {
+                "sqrt": torch.sqrt,  # undefined for negative input
+            },
+            "param_sets": {
+                "1d_abs_fp32": (cached_randn((64,), abs=True, dtype=torch.float32),),
+                "2d_abs_fp32": (
+                    cached_randn((67, 256), abs=True, dtype=torch.float32),
+                ),
+                "3d_abs_fp32": (
+                    cached_randn((32, 64, 128), abs=True, dtype=torch.float32),
+                ),
+            },
+        },
+        (
+            "test_rsqrt_fp32",
+            "test_unary_op",
+        ): {
+            "ops_dict": {
+                "rsqrt": torch.rsqrt,  # undefined for zero or negative input
+            },
+            "param_sets": {
+                "1d_abs_nz_fp32": (
+                    cached_randn((64,), abs=True, dtype=torch.float32) + FP32_EPS,
+                ),
+                "2d_abs_nz_fp32": (
+                    cached_randn((67, 256), abs=True, dtype=torch.float32) + FP32_EPS,
+                ),
+                "3d_abs_nz_fp32": (
+                    cached_randn((32, 64, 128), abs=True, dtype=torch.float32)
+                    + FP32_EPS,
+                ),
+            },
+        },
+        (
             "test_log",
             "test_unary_op",
         ): {
@@ -3745,6 +3782,82 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        ("test_conv2d", "test_conv2d_cpu"): {
+            "param_sets": {
+                "1x3x32_ksize3_no_pad": (
+                    cached_randn((1, 3, 32, 32)),
+                    cached_randn((16, 3, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                "1x3x64_ksize3_pad1": (
+                    cached_randn((1, 3, 64, 64)),
+                    cached_randn((16, 3, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    1,
+                ),
+                "2x3x32_ksize1": (
+                    cached_randn((2, 3, 32, 32)),
+                    cached_randn((8, 3, 1, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                "1x16x64_ksize3_pad1": (
+                    cached_randn((1, 16, 64, 64)),
+                    cached_randn((32, 16, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    1,
+                ),
+                "1x64_ksize3_depthwise": (
+                    cached_randn((1, 64, 32, 32)),
+                    cached_randn((64, 1, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    64,
+                ),
+                "mistral_model": (
+                    cached_randn((1, 3, 392, 532)),
+                    cached_randn((1024, 3, 14, 14)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                "2x32_ksize1_stride2": (
+                    cached_randn((2, 32, 64, 64)),
+                    cached_randn((16, 32, 1, 1)),
+                    None,
+                    (0, 0),
+                    (2, 2),
+                    1,
+                ),
+                "1x3x128_ksize5": (
+                    cached_randn((1, 3, 128, 128)),
+                    cached_randn((8, 3, 5, 5)),
+                    None,
+                    (2, 2),
+                    (1, 1),
+                    1,
+                ),
+                "8x64_ksize3_pad1": (
+                    cached_randn((8, 64, 128, 128)),
+                    cached_randn((64, 1, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    64,
+                ),
+            },
+        },
         ("test_repeat", "test_repeat_cpu"): {
             "param_sets": {
                 "1d_1": (cached_randn((64), dtype=torch.float16), 1),
@@ -3784,6 +3897,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "edge_pow2_64": (0, 16, 8, cached_randn((64,))),
                 "edge_nopad_37": (0, 7, 3, cached_randn((37,))),
                 "edge_nopad_2d": (1, 5, 2, cached_randn((16, 33))),
+            },
+        },
+        ("test_unbind", "test_unbind_cpu"): {
+            "param_sets": {
+                # 1D — produces 0-D scalar tensors
+                "1d_dim0": (0, cached_randn((8,))),
+                # 2D — unbind along each axis
+                "2d_dim0": (0, cached_randn((4, 64))),
+                "2d_dim1": (1, cached_randn((4, 64))),
+                "2d_dimneg1": (-1, cached_randn((4, 64))),
+                # 3D — all three axes, including negative index
+                "3d_dim0": (0, cached_randn((4, 8, 64))),
+                "3d_dim1": (1, cached_randn((4, 8, 64))),
+                "3d_dim2": (2, cached_randn((4, 8, 64))),
+                "3d_dimneg1": (-1, cached_randn((4, 8, 64))),
+                # 4D — innermost and non-innermost axes
+                "4d_dim0": (0, cached_randn((2, 4, 8, 64))),
+                "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
             },
         },
     }
@@ -5129,6 +5260,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
+        def fn(x, weight, bias, padding, stride, groups):
+            return torch.conv2d(
+                x, weight, bias, stride=stride, padding=padding, groups=groups
+            )
+
+        self.compare_with_cpu(
+            fn,
+            x,
+            weight,
+            bias,
+            padding,
+            stride,
+            groups,
+            atol=0.5,
+            rtol=0.1,
+        )
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_cpu(self):
         """Test torch.index_copy operation on Spyre matches CPU in eager mode.
@@ -5233,6 +5382,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         This test verifies the unfold VIEW operation works correctly.
         """
         self.compare_with_cpu(lambda x: x.unfold(dimension, size, step), x)
+
+    def test_unbind_cpu(self, dim: int, x):
+        self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
 
 
 if __name__ == "__main__":
