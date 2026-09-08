@@ -15,15 +15,23 @@
 
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
-import torch
-import torch.nn as nn
-
 from torch._dynamo.guards import GuardBuilder
 
 from torch_spyre.constants import DEVICE_NAME
 
 if TYPE_CHECKING:
+    import torch
+
     from torch_spyre._C import SpyreTensorLayout
+
+
+# Sentinel distinguishing "caller didn't pass target_dtype" (-> resolves to
+# torch.float16, the Spyre DMA hardware requirement) from an explicit
+# ``target_dtype=None`` (-> disable dtype coercion, keep the checkpoint's own
+# dtype). Defined without importing torch at module scope, matching this
+# file's lazy-import convention (torch is only guaranteed importable once
+# this module's patch functions actually run).
+_UNSET = object()
 
 
 def _add_ea(src_tensor, res_tensor) -> None:
@@ -505,15 +513,8 @@ def _patch_invoke_subgraph_decompositions():
     _spyre_extract_nested_region_config._spyre_decomp_patched = True
     mod._extract_nested_region_config = _spyre_extract_nested_region_config
 
-    # ── Safetensors Spyre-aware loading (monkey-patch for safetensors PR #804) ──
-    # safetensors PR #804 adds _register_device_transfer_hook() to the Rust core
-    # and _is_custom_device(). Until that PR is merged we monkey-patch the three
-    # public Python entry points instead. When PR #804 lands, delete
-    # _patch_safetensors_for_spyre() and its call here, then add in
-    # _autoload_impl():
-    #
-    #   from safetensors import _register_device_transfer_hook
-    #   _register_device_transfer_hook(DEVICE_NAME, _spyre_tensor_from_safetensors)
+    # ── Safetensors Spyre-aware loading (monkey-patch) ──────────────────────────
+    # Monkey-patches the three public Python entry points to support device="spyre".
     # ─────────────────────────────────────────────────────────────────────────────
     try:
         _patch_safetensors_for_spyre()
@@ -525,7 +526,7 @@ def _patch_invoke_subgraph_decompositions():
 
 # ── Safetensors hook + monkey-patch ──────────────────────────────────────────
 #
-# Hook signature (matches PR #804 _register_device_transfer_hook contract):
+# Hook signature:
 #
 #   hook(cpu_tensor: torch.Tensor, name: str, device) -> torch.Tensor
 #
@@ -544,8 +545,8 @@ def _patch_invoke_subgraph_decompositions():
 # we recover the tensor kind from its key name — a convention stable across
 # virtually all HuggingFace and standard PyTorch checkpoints:
 #
-#   Embedding table  – 2D tensor whose lowercased key contains any fragment
-#                      from _EMBEDDING_KEY_FRAGMENTS.
+#   Embedding table  – 2D ``.weight`` tensor with an embedding module name as
+#                      a dot-delimited key segment.
 #                      Shape: [vocab_size, hidden_dim] or [max_pos, hidden_dim].
 #                      → _dma_to_spyre_indirect_access (gather-optimal layout).
 #                        Falls back to default if hidden_dim % eps != 0.
@@ -556,18 +557,20 @@ def _patch_invoke_subgraph_decompositions():
 #                      → _dma_to_spyre_dim_order_swapped (dim_order=[1,0],
 #                        matmul-optimal).
 #
-#   lm_head (tied)   – When lm_head is tied to the embedding table the caller
-#                      should use load_model_to_spyre (which has nn.Module
-#                      context). load_file / safe_open see it as a free 2D
-#                      weight and apply dim_order=[1,0], which is correct for
-#                      the matmul path and merely sub-optimal for the tied case.
+#   lm_head          – load_file / safe_open have no model context, so an
+#                      lm_head is treated as a Linear weight. This is always
+#                      correct, but may be sub-optimal when the model later ties
+#                      it to an embedding table.
 #
 #   Everything else  – bias, layer-norm params, 1-D buffers, etc.
 #                      → _dma_to_spyre_default (stickify last dim).
 # ─────────────────────────────────────────────────────────────────────────────
 
-_EMBEDDING_KEY_FRAGMENTS: tuple = (
-    "embed",  # embeddings, embed_tokens, embedding, …
+_EMBEDDING_MODULE_NAMES: tuple = (
+    "embed",
+    "embedding",
+    "embeddings",
+    "embed_tokens",
     "wte",  # GPT-2 word-token embeddings
     "wpe",  # GPT-2 word-position embeddings
     "tok_embed",
@@ -585,11 +588,12 @@ def _classify_safetensors_key(name: str, ndim: int) -> str:
     """
     if ndim != 2:
         return "other"
-    name_lower = name.lower()
-    for frag in _EMBEDDING_KEY_FRAGMENTS:
-        if frag in name_lower:
-            return "embedding"
-    if name_lower.endswith(".weight"):
+    parts = name.lower().split(".")
+    if parts[-1] != "weight":
+        return "other"
+    if any(part in _EMBEDDING_MODULE_NAMES for part in parts[:-1]):
+        return "embedding"
+    if len(parts) > 1:
         return "linear"
     return "other"
 
@@ -598,8 +602,9 @@ def _spyre_tensor_from_safetensors(
     cpu_tensor: "torch.Tensor",
     name: str,
     device,  # str | torch.device — honoured by forward-compat; index unused for now
+    target_dtype=_UNSET,
 ) -> "torch.Tensor":
-    """Spyre device-transfer hook for safetensors (PR #804 contract).
+    """Spyre device-transfer hook for safetensors.
 
     Receives a CPU tensor loaded from a safetensors file and returns a tensor
     on the Spyre device with the optimal layout for the tensor's role.
@@ -609,6 +614,15 @@ def _spyre_tensor_from_safetensors(
         Falls back to default if ``hidden_dim % elems_per_stick != 0``.
       - 2D Linear weight           → ``dim_order=[1, 0]`` (matmul-optimal).
       - Everything else            → default Spyre layout (stickify last dim).
+
+    ``target_dtype`` selects the on-device float dtype for floating-point
+    tensors, threaded through to the ``_dma_to_spyre_*`` helpers in
+    model_utils.py (same ``target_dtype`` parameter they already expose).
+    Left unspecified, it resolves to ``torch.float16`` — the Spyre DMA
+    hardware requirement. Pass ``target_dtype=None`` explicitly to disable
+    coercion and keep the checkpoint's own dtype (e.g. for CPU-stub tests
+    with no hardware DMA constraint). Non-floating-point tensors (e.g. int
+    buffers) are never coerced, regardless of ``target_dtype``.
     """
     from torch_spyre.model_utils import (
         _dma_to_spyre_default,
@@ -619,8 +633,25 @@ def _spyre_tensor_from_safetensors(
 
     logger = get_inductor_logger("model_utils")
 
-    if cpu_tensor.dtype != torch.float16 and cpu_tensor.dtype.is_floating_point:
-        cpu_tensor = cpu_tensor.to(dtype=torch.float16)
+    if target_dtype is _UNSET:
+        import torch
+
+        target_dtype = torch.float16
+
+    # Only floating-point tensors are eligible for coercion — an int buffer
+    # (e.g. position ids) must never be cast to a float dtype.
+    dma_target_dtype = target_dtype if cpu_tensor.dtype.is_floating_point else None
+
+    # Cast on CPU *before* the DMA helpers see this tensor, using the same
+    # dma_target_dtype that's about to be threaded into them
+    # copy_tensor's DMA path is measurably faster on a same-dtype
+    # transfer than on a cross-dtype one (e.g. bf16 checkpoint -> fp16
+    # device), so casting here with PyTorch's own vectorized `.to()` and
+    # handing the DMA helpers an already-matching dtype avoids that cost.
+    # Passing target_dtype=None disables this entirely, same as before.
+    if dma_target_dtype is not None and cpu_tensor.dtype != dma_target_dtype:
+        cpu_tensor = cpu_tensor.to(dtype=dma_target_dtype)
+
     # The mmap fast-path in safetensors gives us a memoryview-backed
     # frombuffer view. Make it contiguous before any Spyre DMA call.
     if not cpu_tensor.is_contiguous():
@@ -629,7 +660,9 @@ def _spyre_tensor_from_safetensors(
     kind = _classify_safetensors_key(name, cpu_tensor.ndim)
 
     if kind == "embedding":
-        result = _dma_to_spyre_indirect_access(cpu_tensor)
+        result = _dma_to_spyre_indirect_access(
+            cpu_tensor, target_dtype=dma_target_dtype
+        )
         if result is not None:
             logger.debug(
                 "safetensors: %s shape=%s -> Spyre indirect-access (gather) layout",
@@ -643,7 +676,7 @@ def _spyre_tensor_from_safetensors(
             name,
             list(cpu_tensor.shape),
         )
-        return _dma_to_spyre_default(cpu_tensor)
+        return _dma_to_spyre_default(cpu_tensor, target_dtype=dma_target_dtype)
 
     if kind == "linear":
         logger.debug(
@@ -651,7 +684,9 @@ def _spyre_tensor_from_safetensors(
             name,
             list(cpu_tensor.shape),
         )
-        return _dma_to_spyre_dim_order_swapped(cpu_tensor)
+        return _dma_to_spyre_dim_order_swapped(
+            cpu_tensor, target_dtype=dma_target_dtype
+        )
 
     # "other": bias, norms, 1-D buffers, etc.
     logger.debug(
@@ -659,7 +694,7 @@ def _spyre_tensor_from_safetensors(
         name,
         list(cpu_tensor.shape),
     )
-    return _dma_to_spyre_default(cpu_tensor)
+    return _dma_to_spyre_default(cpu_tensor, target_dtype=dma_target_dtype)
 
 
 class _SpyreSafeOpen:
@@ -673,8 +708,16 @@ class _SpyreSafeOpen:
     read metadata work without changes.
 
     ``get_slice`` returns a ``_SpyreSafeSlice`` wrapper that applies the hook
-    on ``__getitem__``, matching the slice-dispatch behaviour that safetensors
-    PR #804 patch-2 adds to the Rust core.
+    on ``__getitem__``, matching the slice-dispatch behaviour of the Rust core.
+
+    ``target_dtype`` (default: unset, which resolves to ``torch.float16`` —
+    the Spyre DMA hardware requirement) is stored and threaded through to
+    every tensor access. Pass ``target_dtype=None`` to disable coercion.
+
+    The stored ``_target_dtype`` attribute may be ``_UNSET`` (the sentinel
+    meaning "resolve to fp16 at DMA time") rather than an actual
+    ``torch.dtype``.  Inspect ``_target_dtype is _UNSET`` rather than
+    comparing it to a dtype in any code that reads this attribute.
     """
 
     def __init__(
@@ -682,6 +725,7 @@ class _SpyreSafeOpen:
         filename,
         framework: str,
         backend: str = "mmap",
+        target_dtype=_UNSET,
     ):
         import safetensors as _st_mod
 
@@ -689,6 +733,7 @@ class _SpyreSafeOpen:
         self._handle = _st_mod._orig_safe_open(
             filename, framework=framework, device="cpu", backend=backend
         )
+        self._target_dtype = target_dtype
 
     def __enter__(self) -> "_SpyreSafeOpen":
         self._handle.__enter__()
@@ -703,8 +748,8 @@ class _SpyreSafeOpen:
         return self._handle.keys()
 
     def offset_keys(self) -> List[str]:
-        """Alias for ``keys()``; present for callers that use the older API."""
-        return self._handle.keys()
+        """Return keys in file-offset order for sequential-read locality."""
+        return self._handle.offset_keys()
 
     def metadata(self) -> Optional[Dict[str, str]]:
         return self._handle.metadata()
@@ -714,40 +759,47 @@ class _SpyreSafeOpen:
     def get_tensor(self, key: str) -> "torch.Tensor":
         """Load ``key`` on CPU then DMA to Spyre with the optimal layout."""
         cpu_tensor = self._handle.get_tensor(key)
-        return _spyre_tensor_from_safetensors(cpu_tensor, key, DEVICE_NAME)
+        return _spyre_tensor_from_safetensors(
+            cpu_tensor, key, DEVICE_NAME, target_dtype=self._target_dtype
+        )
 
     def get_tensors(self) -> Dict[str, "torch.Tensor"]:
-        """Load all tensors and DMA each to Spyre with the optimal layout.
-
-        Matches the ``safe_open.get_tensors()`` API added by safetensors PR #786.
-        """
+        """Load all tensors and DMA each to Spyre with the optimal layout."""
         result: Dict[str, "torch.Tensor"] = {}
-        for key in self._handle.keys():
+        for key in self._handle.offset_keys():
             result[key] = self.get_tensor(key)
         return result
 
     def get_slice(self, key: str) -> "_SpyreSafeSlice":
         """Return a ``_SpyreSafeSlice`` that applies the Spyre hook on indexing."""
-        return _SpyreSafeSlice(self._handle.get_slice(key), key)
+        return _SpyreSafeSlice(
+            self._handle.get_slice(key), key, target_dtype=self._target_dtype
+        )
+
+    def __getattr__(self, name):
+        """Forward methods added by future safetensors releases."""
+        return getattr(self._handle, name)
 
 
 class _SpyreSafeSlice:
     """Slice wrapper: applies ``_spyre_tensor_from_safetensors`` on ``__getitem__``.
 
-    Matches the behaviour added to ``PySafeSlice.__getitem__`` by safetensors
-    PR #804 patch-2 (``slice_custom_device``): gather bytes on CPU first,
-    then invoke the hook. This avoids the double-dispatch problem that would
-    arise if we applied the hook inside the Rust slice path (Spyre → Spyre copy).
+    Gathers bytes on CPU first, then invokes the hook. This avoids the
+    double-dispatch problem that would arise if we applied the hook inside
+    the Rust slice path (Spyre → Spyre copy).
     """
 
-    def __init__(self, cpu_slice, name: str):
+    def __init__(self, cpu_slice, name: str, target_dtype=_UNSET):
         self._cpu_slice = cpu_slice
         self._name = name
+        self._target_dtype = target_dtype
 
     def __getitem__(self, slices) -> "torch.Tensor":
         # The underlying CPU slice gives us a contiguous CPU tensor.
         cpu_tensor = self._cpu_slice[slices]
-        return _spyre_tensor_from_safetensors(cpu_tensor, self._name, DEVICE_NAME)
+        return _spyre_tensor_from_safetensors(
+            cpu_tensor, self._name, DEVICE_NAME, target_dtype=self._target_dtype
+        )
 
 
 def _patch_safetensors_for_spyre() -> None:
@@ -766,21 +818,13 @@ def _patch_safetensors_for_spyre() -> None:
        through the hook path.
 
     3. ``safetensors.torch.load_model(model, filename, device="spyre")``
-       Loads the state dict on CPU, uses ``_assign_tensors_to_model`` (PR #804's
-       direct-assignment path) to install tensors that have already been moved
-       to Spyre by the hook. Falls back to ``load_model_to_spyre`` for the
-       full nn.Linear / nn.Embedding isinstance optimisation.
+       Loads the state dict directly to Spyre via the patched load_file, then
+       assigns each tensor into the model with direct _parameters / _buffers
+       replacement, avoiding the copy_() no-op that breaks meta-device models.
 
     All patches are idempotent (``_spyre_patched`` sentinel). Non-Spyre
     device paths fall through to the originals.
 
-    Removal note — when safetensors PR #804 merges
-    ────────────────────────────────────────────────
-    Delete this function and its call in ``_patch_tensor_for_spyre``.
-    Add in ``_autoload_impl``::
-
-        from safetensors import _register_device_transfer_hook
-        _register_device_transfer_hook(DEVICE_NAME, _spyre_tensor_from_safetensors)
     """
     try:
         import safetensors as _st_mod
@@ -803,7 +847,12 @@ def _patch_safetensors_for_spyre() -> None:
             _spyre_patched = True
 
             def __new__(
-                cls, filename, framework: str, device=None, backend: str = "mmap"
+                cls,
+                filename,
+                framework: str,
+                device=None,
+                backend: str = "mmap",
+                target_dtype=_UNSET,
             ):
                 if (
                     device is not None
@@ -811,8 +860,13 @@ def _patch_safetensors_for_spyre() -> None:
                     and framework == "pt"
                 ):
                     return _SpyreSafeOpen(
-                        filename, framework=framework, backend=backend
+                        filename,
+                        framework=framework,
+                        backend=backend,
+                        target_dtype=target_dtype,
                     )
+                # Non-Spyre device: the original safe_open has no
+                # target_dtype concept, so it is intentionally not forwarded.
                 return _orig(
                     filename, framework=framework, device=device, backend=backend
                 )
@@ -824,19 +878,6 @@ def _patch_safetensors_for_spyre() -> None:
             _st_torch.safe_open = _SpyreSafeOpenDispatch
 
     # ── 2. Patch safetensors.torch.load_file ─────────────────────────────────
-    # Capture the un-patched load_file unconditionally — _spyre_load_model
-    # (block 3) needs it for the CPU load regardless of whether block 2 runs.
-    _orig_load_file = getattr(_st_torch.load_file, "__wrapped__", None) or (
-        _st_torch.load_file
-        if not getattr(_st_torch.load_file, "_spyre_patched", False)
-        else None
-    )
-    if _orig_load_file is None:
-        # Already patched; recover the original from the closure attribute we
-        # store below, or fall back to the live (patched) function — the
-        # Spyre path inside it still loads CPU correctly for non-Spyre device.
-        _orig_load_file = getattr(_st_torch.load_file, "_orig", _st_torch.load_file)
-
     if not getattr(_st_torch.load_file, "_spyre_patched", False):
         _unpatched_load_file = _st_torch.load_file
 
@@ -845,13 +886,18 @@ def _patch_safetensors_for_spyre() -> None:
             device: Union[str, int] = "cpu",
             *,
             backend: str = "mmap",
+            target_dtype=_UNSET,
         ) -> Dict[str, "torch.Tensor"]:
             if str(device).split(":")[0] != DEVICE_NAME:
                 return _unpatched_load_file(filename, device=device, backend=backend)
             # Route through the patched safe_open so get_tensors() applies
             # the Spyre hook per tensor.
             with _st_mod.safe_open(
-                filename, framework="pt", device=DEVICE_NAME, backend=backend
+                filename,
+                framework="pt",
+                device=DEVICE_NAME,
+                backend=backend,
+                target_dtype=target_dtype,
             ) as f:
                 return f.get_tensors()
 
@@ -865,7 +911,7 @@ def _patch_safetensors_for_spyre() -> None:
     #   which is a no-op — the parameter stays on meta. A subsequent
     #   load_model_to_spyre() then tries to DMA from meta → Spyre and crashes.
     #
-    # Correct flow (mirrors PR #804's assign=True path):
+    # Correct flow:
     #   1. load_file(device="spyre") — each tensor is ALREADY on Spyre with
     #      the optimal layout via _spyre_tensor_from_safetensors.
     #   2. _assign_tensors_to_model() — directly replaces model._parameters[name]
@@ -882,11 +928,17 @@ def _patch_safetensors_for_spyre() -> None:
             *,
             assign: Optional[bool] = None,
             backend: str = "mmap",
+            target_dtype=_UNSET,
         ):
             if str(device).split(":")[0] != DEVICE_NAME:
                 return _orig_load_model(
                     model, filename, strict=strict, device=device, backend=backend
                 )
+
+            if target_dtype is not None and target_dtype is not _UNSET:
+                from torch_spyre.model_utils import _validate_target_dtype
+
+                _validate_target_dtype(target_dtype)
 
             # Load state dict directly to Spyre — each tensor gets the optimal
             # layout for its role (embedding/linear/other) via the hook.
@@ -894,48 +946,74 @@ def _patch_safetensors_for_spyre() -> None:
             # local _spyre_load_file name, which may not be bound if block 2
             # was skipped due to idempotency.
             state_dict = _st_torch.load_file(
-                filename, device=DEVICE_NAME, backend=backend
+                filename, device=DEVICE_NAME, backend=backend, target_dtype=target_dtype
             )
 
-            # Duplicate-name removal (tied weights etc.) — same logic as the
-            # upstream safetensors load_model.
-            model_sd = model.state_dict()
-            to_removes = _st_torch._remove_duplicate_names(
-                model_sd, preferred_names=list(state_dict.keys())
-            )
+            import torch.nn as nn
+            from torch_spyre._inductor.logging_utils import get_inductor_logger
 
-            # Directly assign tensors into model._parameters / _buffers so that
-            # meta-device parameters are replaced rather than copy_()'d into.
-            # This matches PR #804's _assign_tensors_to_model path.
+            logger = get_inductor_logger("model_utils")
+            # Coercion is only "off" when the caller explicitly passed
+            # target_dtype=None. If unspecified (_UNSET), the hook above
+            # already resolved it to torch.float16 per-tensor — a dtype
+            # mismatch against the model's own dtype is then expected and
+            # intentional (the Spyre DMA hardware requirement), not an error.
+            coercion_disabled = target_dtype is None
+
+            # Group aliases before assignment. named_parameters() normally
+            # deduplicates tied parameters; replacing only the first name would
+            # silently sever the tie and leave the other alias unloaded.
+            parameter_groups: Dict[int, List[tuple]] = {}
+            for name, param in model.named_parameters(remove_duplicate=False):
+                parameter_groups.setdefault(id(param), []).append((name, param))
+
             missing_keys: List[str] = []
-            unexpected_keys: List[str] = list(state_dict.keys())
-
-            for name, param in model.named_parameters():
-                if name not in state_dict:
-                    missing_keys.append(name)
+            consumed_keys = set()
+            for aliases in parameter_groups.values():
+                checkpoint_names = [name for name, _ in aliases if name in state_dict]
+                if not checkpoint_names:
+                    missing_keys.append(aliases[0][0])
                     continue
-                spyre_tensor = state_dict[name]
+
+                checkpoint_name = checkpoint_names[0]
+                spyre_tensor = state_dict[checkpoint_name]
+                param = aliases[0][1]
                 if spyre_tensor.shape != param.shape:
                     raise RuntimeError(
-                        f"size mismatch for {name}: copying a param with shape "
+                        f"size mismatch for {checkpoint_name}: copying a param with shape "
                         f"{spyre_tensor.shape} from checkpoint, the shape in "
                         f"current model is {param.shape}."
                     )
                 if spyre_tensor.dtype != param.dtype:
-                    raise RuntimeError(
-                        f"dtype mismatch for {name}: checkpoint has "
-                        f"{spyre_tensor.dtype}, model expects {param.dtype}."
+                    if coercion_disabled:
+                        raise RuntimeError(
+                            f"dtype mismatch for {checkpoint_name}: checkpoint has "
+                            f"{spyre_tensor.dtype}, model expects {param.dtype}."
+                        )
+                    # target_dtype coerced this tensor on the way in (e.g. the
+                    # Spyre fp16 DMA requirement) — the model's post-load
+                    # dtype for this param is now spyre_tensor.dtype by
+                    # construction, since this is a Parameter replacement,
+                    # not a copy_(). Not an error, but worth a trace.
+                    logger.info(
+                        "%s: model dtype %s coerced to %s on Spyre load "
+                        "(target_dtype=%s)",
+                        checkpoint_name,
+                        param.dtype,
+                        spyre_tensor.dtype,
+                        target_dtype,
                     )
-                parts = name.rsplit(".", 1)
-                parent = model.get_submodule(parts[0]) if len(parts) == 2 else model
-                attr = parts[-1]
-                if name in unexpected_keys:
-                    unexpected_keys.remove(name)
-                parent._parameters[attr] = nn.Parameter(
+
+                replacement = nn.Parameter(
                     spyre_tensor, requires_grad=param.requires_grad
                 )
+                for name, _ in aliases:
+                    parts = name.rsplit(".", 1)
+                    parent = model.get_submodule(parts[0]) if len(parts) == 2 else model
+                    parent._parameters[parts[-1]] = replacement
+                consumed_keys.update(checkpoint_names)
 
-            for name, buf in model.named_buffers():
+            for name, buf in model.named_buffers(remove_duplicate=False):
                 if name not in state_dict:
                     missing_keys.append(name)
                     continue
@@ -947,39 +1025,39 @@ def _patch_safetensors_for_spyre() -> None:
                         f"current model is {buf.shape}."
                     )
                 if spyre_tensor.dtype != buf.dtype:
-                    raise RuntimeError(
-                        f"dtype mismatch for {name}: checkpoint has "
-                        f"{spyre_tensor.dtype}, model expects {buf.dtype}."
+                    if coercion_disabled:
+                        raise RuntimeError(
+                            f"dtype mismatch for {name}: checkpoint has "
+                            f"{spyre_tensor.dtype}, model expects {buf.dtype}."
+                        )
+                    logger.info(
+                        "%s: model dtype %s coerced to %s on Spyre load "
+                        "(target_dtype=%s)",
+                        name,
+                        buf.dtype,
+                        spyre_tensor.dtype,
+                        target_dtype,
                     )
                 parts = name.rsplit(".", 1)
                 parent = model.get_submodule(parts[0]) if len(parts) == 2 else model
-                attr = parts[-1]
-                if name in unexpected_keys:
-                    unexpected_keys.remove(name)
-                parent._buffers[attr] = spyre_tensor
+                parent._buffers[parts[-1]] = spyre_tensor
+                consumed_keys.add(name)
 
-            # Reconcile tied-weight duplicates (same logic as upstream load_model).
-            missing_set = set(missing_keys)
-            for to_remove_group in to_removes.values():
-                for to_remove in to_remove_group:
-                    if to_remove not in missing_set:
-                        unexpected_keys.append(to_remove)
-                    else:
-                        missing_set.remove(to_remove)
+            unexpected_keys = [name for name in state_dict if name not in consumed_keys]
 
-            if strict and (missing_set or unexpected_keys):
-                missing_str = ", ".join(f'"{k}"' for k in sorted(missing_set))
-                unexpected_str = ", ".join(f'"{k}"' for k in sorted(unexpected_keys))
+            if strict and (missing_keys or unexpected_keys):
+                missing_str = ", ".join(f'"{k}"' for k in missing_keys)
+                unexpected_str = ", ".join(f'"{k}"' for k in unexpected_keys)
                 error = (
                     f"Error(s) in loading state_dict for {model.__class__.__name__}:"
                 )
-                if missing_set:
+                if missing_keys:
                     error += f"\n    Missing key(s) in state_dict: {missing_str}"
                 if unexpected_keys:
                     error += f"\n    Unexpected key(s) in state_dict: {unexpected_str}"
                 raise RuntimeError(error)
 
-            return list(missing_set), unexpected_keys
+            return missing_keys, unexpected_keys
 
         _spyre_load_model._spyre_patched = True  # type: ignore[attr-defined]
         _st_torch.load_model = _spyre_load_model
