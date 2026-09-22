@@ -445,6 +445,21 @@ def _patch_tensor_for_spyre():
     # ──────────────────────────────────────────────────────────────────────────
     _patch_invoke_subgraph_decompositions()
 
+    # ── Safetensors Spyre-aware loading (monkey-patch) ──────────────────────
+    # Monkey-patches the three public Python entry points to support
+    # device="spyre". Unrelated to invoke_subgraph decompositions, so this is
+    # called directly from here rather than from inside
+    # _patch_invoke_subgraph_decompositions() (which also has its own early
+    # return for idempotency, and would silently skip this call on any
+    # re-entry after the first).
+    # ──────────────────────────────────────────────────────────────────────
+    try:
+        _patch_safetensors_for_spyre()
+    except Exception as e:  # pragma: no cover - safetensors may not be installed
+        import warnings
+
+        warnings.warn(f"Failed to install safetensors Spyre patches: {e}")
+
 
 def _patch_invoke_subgraph_decompositions():
     """Thread the Spyre decomp table into invoke_subgraph subgraph re-traces.
@@ -512,16 +527,6 @@ def _patch_invoke_subgraph_decompositions():
 
     _spyre_extract_nested_region_config._spyre_decomp_patched = True
     mod._extract_nested_region_config = _spyre_extract_nested_region_config
-
-    # ── Safetensors Spyre-aware loading (monkey-patch) ──────────────────────────
-    # Monkey-patches the three public Python entry points to support device="spyre".
-    # ─────────────────────────────────────────────────────────────────────────────
-    try:
-        _patch_safetensors_for_spyre()
-    except Exception as e:  # pragma: no cover - safetensors may not be installed
-        import warnings
-
-        warnings.warn(f"Failed to install safetensors Spyre patches: {e}")
 
 
 # ── Safetensors hook + monkey-patch ──────────────────────────────────────────
@@ -822,6 +827,42 @@ def _patch_safetensors_for_spyre() -> None:
     except ImportError:
         return  # safetensors not installed
 
+    # The ``backend`` kwarg (mmap vs. pread) on safe_open / load_file /
+    # load_model was only added in safetensors 0.8.0. All three wrappers
+    # below unconditionally forward ``backend=`` to the *original* function
+    # on the non-Spyre pass-through path (e.g. device="cpu"), and Python does
+    # not silently drop an unexpected keyword argument — on an older
+    # safetensors this would raise TypeError for every caller, Spyre or not.
+    # That would be a global regression just from importing torch_spyre with
+    # safetensors < 0.8.0 installed, so refuse to install any of these
+    # patches in that case rather than risk breaking unrelated CPU/GPU loads.
+    def _parse_version(v: str) -> tuple:
+        parts = []
+        for p in str(v).split(".")[:3]:
+            digits = ""
+            for ch in p:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+            parts.append(int(digits) if digits else 0)
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts)
+
+    _installed_version = _parse_version(getattr(_st_mod, "__version__", "0"))
+    if _installed_version < (0, 8, 0):
+        import warnings
+
+        warnings.warn(
+            "torch_spyre's safetensors Spyre-aware loading requires "
+            f"safetensors>=0.8.0 (found {getattr(_st_mod, '__version__', 'unknown')}); "
+            "skipping the monkey-patch. device='spyre' loading via "
+            "safe_open/load_file/load_model will not be available until "
+            "safetensors is upgraded; non-Spyre loading is unaffected."
+        )
+        return
+
     # ── 1. Wrap safetensors.safe_open ────────────────────────────────────────
     # Stash the original Rust class under _orig_safe_open so _SpyreSafeOpen
     # can always reach it regardless of further patching.
@@ -1004,6 +1045,18 @@ def _patch_safetensors_for_spyre() -> None:
                 consumed_keys.update(checkpoint_names)
 
             for name, buf in model.named_buffers(remove_duplicate=False):
+                parts = name.rsplit(".", 1)
+                parent = model.get_submodule(parts[0]) if len(parts) == 2 else model
+                attr = parts[-1]
+                # Non-persistent buffers (register_buffer(..., persistent=False)
+                # -- e.g. HF rotary-embedding inv_freq, cached causal masks,
+                # position ids) are intentionally excluded from
+                # nn.Module.state_dict() and therefore never appear in a
+                # checkpoint. Treating them as "missing" here would make
+                # strict=True raise on ordinary HF models. Mirror
+                # state_dict()'s own filtering instead of reporting them.
+                if attr in getattr(parent, "_non_persistent_buffers_set", ()):
+                    continue
                 if name not in state_dict:
                     missing_keys.append(name)
                     continue
@@ -1028,9 +1081,7 @@ def _patch_safetensors_for_spyre() -> None:
                         spyre_tensor.dtype,
                         target_dtype,
                     )
-                parts = name.rsplit(".", 1)
-                parent = model.get_submodule(parts[0]) if len(parts) == 2 else model
-                parent._buffers[parts[-1]] = spyre_tensor
+                parent._buffers[attr] = spyre_tensor
                 consumed_keys.add(name)
 
             unexpected_keys = [name for name in state_dict if name not in consumed_keys]

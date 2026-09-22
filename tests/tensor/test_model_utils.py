@@ -15,7 +15,6 @@
 # Owner(s): ["module: spyre"]
 
 import unittest
-from unittest import mock
 
 import torch
 import torch.nn as nn
